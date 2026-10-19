@@ -60,9 +60,14 @@ export class ImageDiffViewer
 
   toggleActivePanelDiff() {
     if (this.lastActiveDiffPanel) {
-      this.lastActiveDiffPanel.webview.postMessage({
-        type: "toggle_diff",
-      } as HostToWebviewMessages);
+      try {
+        this.lastActiveDiffPanel.webview.postMessage({
+          type: "toggle_diff",
+        } as HostToWebviewMessages);
+      } catch (e) {
+        // Ignore postMessage errors when panel is gone
+        console.error(e);
+      }
     }
   }
 
@@ -79,8 +84,16 @@ export class ImageDiffViewer
       type: "toggle_swipe_changed",
     };
 
-    this.lastActiveDiffPanel.webview.postMessage(originalViewMessage);
-    this.lastActiveNonDiffPanel.webview.postMessage(changedViewMessage);
+    try {
+      this.lastActiveDiffPanel.webview.postMessage(originalViewMessage);
+    } catch (e) {
+      console.error(e);
+    }
+    try {
+      this.lastActiveNonDiffPanel.webview.postMessage(changedViewMessage);
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   private registerOpenDocument(
@@ -221,69 +234,130 @@ const setupWebview = async ({
     ),
     vscode.Uri.joinPath(context.extensionUri, "out", "webview"),
   ];
-  webviewPanel.webview.options = {
-    enableScripts: true,
-    localResourceRoots,
-  };
-  const { initialSelectedAlignment } = getExtensionConfiguration();
-  webviewPanel.webview.html = await getWebviewHtml({
-    panel: webviewPanel,
-    document,
-    diffTarget,
-    context,
-    selectedAlignment: initialSelectedAlignment,
+
+  // Track if this panel has been disposed while async work was happening.
+  let panelDisposed = false;
+  webviewPanel.onDidDispose(() => {
+    panelDisposed = true;
   });
+
+  try {
+    if (panelDisposed) return;
+    webviewPanel.webview.options = {
+      enableScripts: true,
+      localResourceRoots,
+    };
+  } catch (err) {
+    // If the panel is already gone, bail out quietly.
+    console.error("Failed to set webview options", err);
+    return;
+  }
+
+  const { initialSelectedAlignment } = getExtensionConfiguration();
+  try {
+    if (panelDisposed) return;
+    // Getting the HTML is async and the panel may be disposed during the await.
+    const html = await getWebviewHtml({
+      panel: webviewPanel,
+      document,
+      diffTarget,
+      context,
+      selectedAlignment: initialSelectedAlignment,
+    });
+    if (panelDisposed) return;
+    webviewPanel.webview.html = html;
+  } catch (err) {
+    console.error("Failed to set webview HTML", err);
+    return;
+  }
+
   let otherView = diffWebview;
   document.onWebviewOpen((newPanel) => {
     otherView = newPanel;
   });
+
   webviewPanel.webview.onDidReceiveMessage(
     async (message: WebviewToHostMessages) => {
-      if (message.type === "ready") {
-        const config = getExtensionConfiguration();
-        webviewPanel.webview.postMessage({
-          type: "show_image",
-          options: {
-            minScaleOne: config.minScaleOne,
-            showDiffByDefault: config.showDiffByDefault,
-            imageRendering: config.imageRendering,
-          },
-        } as ShowImageMessage);
-        webviewPanel.webview.postMessage({
-          type: "enable_transform_report",
-        } as EnableTransformReport);
-        diffTarget?.registerNewWebview(webviewPanel);
-        if (diffWebview) {
-          diffWebview.webview.postMessage({
-            type: "enable_transform_report",
-          } as EnableTransformReport);
+      if (panelDisposed) return;
+      try {
+        if (message.type === "ready") {
+          const config = getExtensionConfiguration();
+          try {
+            webviewPanel.webview.postMessage({
+              type: "show_image",
+              options: {
+                minScaleOne: config.minScaleOne,
+                showDiffByDefault: config.showDiffByDefault,
+                imageRendering: config.imageRendering,
+              },
+            } as ShowImageMessage);
+            webviewPanel.webview.postMessage({
+              type: "enable_transform_report",
+            } as EnableTransformReport);
+          } catch (e) {
+            console.error("Failed to post ready messages", e);
+          }
+
+          try {
+            diffTarget?.registerNewWebview(webviewPanel);
+          } catch (e) {
+            console.error("Failed to register new webview on diffTarget", e);
+          }
+
+          if (diffWebview) {
+            try {
+              diffWebview.webview.postMessage({
+                type: "enable_transform_report",
+              } as EnableTransformReport);
+            } catch (e) {
+              console.error("Failed to post enable_transform_report to diffWebview", e);
+            }
+          }
+        } else if (message.type === "transform") {
+          if (otherView) {
+            try {
+              otherView.webview.postMessage({
+                type: "transform",
+                data: message.data,
+              } as TransformWebviewMessage);
+            } catch (e) {
+              console.error("Failed to forward transform to other view", e);
+            }
+          }
+        } else if (message.type === "change_align") {
+          if (panelDisposed) return;
+          try {
+            // Recompute HTML for the new alignment. Bail out if panel disposed.
+            const html = await getWebviewHtml({
+              panel: webviewPanel,
+              document,
+              diffTarget,
+              context,
+              selectedAlignment: message.data as AlignmentOption,
+            });
+            if (panelDisposed) return;
+            webviewPanel.webview.html = html;
+          } catch (e) {
+            console.error("Failed to change alignment and update HTML", e);
+          }
+        } else if (message.type === "original_swipe_adjustment") {
+          if (otherView) {
+            const otherMessage: OffsetXYMessage = {
+              type: "offset_xy",
+              data: { dx: message.data.width, dy: message.data.height },
+            };
+            try {
+              otherView.webview.postMessage(otherMessage);
+            } catch (e) {
+              console.error("Failed to post offset to other view", e);
+            }
+          }
+        } else {
+          // @ts-expect-error Makes sure we always handle messages
+          throw new Error("Unsupported message: " + message.type);
         }
-      } else if (message.type === "transform") {
-        if (otherView) {
-          otherView.webview.postMessage({
-            type: "transform",
-            data: message.data,
-          } as TransformWebviewMessage);
-        }
-      } else if (message.type === "change_align") {
-        webviewPanel.webview.html = await getWebviewHtml({
-          panel: webviewPanel,
-          document,
-          diffTarget,
-          context,
-          selectedAlignment: message.data as AlignmentOption,
-        });
-      } else if (message.type === "original_swipe_adjustment") {
-        if (otherView) {
-          const otherMessage: OffsetXYMessage = {
-            type: "offset_xy",
-            data: { dx: message.data.width, dy: message.data.height },
-          };
-          otherView.webview.postMessage(otherMessage);
-        }
-      } else {
-        // @ts-expect-error Makes sure we always handle messages
-        throw new Error("Unsupported message: " + message.type);
+      } catch (err) {
+        console.error("Error handling webview message", err);
       }
     },
   );
