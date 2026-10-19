@@ -1,0 +1,82 @@
+name: Build and publish VSIX to Releases
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Enable corepack (Yarn)
+        run: |
+          corepack enable
+
+      - name: Install dependencies
+        run: |
+          # Use yarn if available, fallback to npm
+          if [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Build extension
+        run: |
+          # Build extension and webview bundles
+          if [ -f package.json ]; then
+            if grep -q "pack:extension" package.json; then
+              yarn build || npm run build
+            else
+              yarn build || npm run build || true
+            fi
+          fi
+
+      - name: Set release tag and name
+        id: tag
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG_NAME="v${VERSION}"
+          echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
+          echo "RELEASE_NAME=Image diff viewer ${TAG_NAME}" >> $GITHUB_ENV
+
+      - name: Package VSIX
+        run: |
+          # Use vsce to package the extension into a .vsix. vsce is in devDependencies.
+          npx @vscode/vsce package -o image-diff-${{ env.TAG_NAME }}.vsix
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          release_name: ${{ env.RELEASE_NAME }}
+          body: |
+            Automated build of VS Code extension package (.vsix) from commit ${{ github.sha }}.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload VSIX to Release
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./image-diff-${{ env.TAG_NAME }}.vsix
+          asset_name: image-diff-${{ env.TAG_NAME }}.vsix
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
